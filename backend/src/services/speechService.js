@@ -1,102 +1,86 @@
-import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { execSync } from "child_process";
-import { fileURLToPath } from "url";
+import FormData from "form-data";
+import https from "https";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL   = "whisper-large-v3-turbo";
 
-// ── Config ────────────────────────────────────────────────────────────────────
-// Whisper model size: tiny | base | small | medium | large
-// tiny  = fastest, ~75 MB  | base = good balance ~150 MB (default)
-// small = better accuracy  | medium/large = best (needs lots of RAM)
-const WHISPER_MODEL = process.env.WHISPER_MODEL || "base";
-
-// Python executable — override via PYTHON_BIN in .env if needed
-const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3");
-
-// Path to the transcription helper script
-const WHISPER_SCRIPT = path.join(__dirname, "whisperTranscribe.py");
-
-// ── Convert audio to 16kHz mono WAV (whisper works best with this) ────────────
-function convertToWav(inputPath) {
-  const outputPath = inputPath.replace(/\.[^.]+$/, "_whisper.wav");
+function convertAudio(inputPath) {
+  const outputPath = inputPath.replace(/\.[^.]+$/, "_groq.mp3");
   try {
-    execSync(
-      `ffmpeg -y -i "${inputPath}" -ar 16000 -ac 1 -sample_fmt s16 "${outputPath}"`,
-      { stdio: "pipe" }
-    );
+    execSync(`ffmpeg -y -i "${inputPath}" -ar 16000 -ac 1 -b:a 64k "${outputPath}"`, { stdio: "pipe" });
     return outputPath;
-  } catch (err) {
-    throw new Error(
-      "ffmpeg is required for audio conversion.\n" +
-      "Windows: winget install ffmpeg\n" +
-      "Mac:     brew install ffmpeg\n" +
-      "Linux:   sudo apt install ffmpeg\n" +
-      `Error: ${err.message}`
-    );
-  }
-}
-
-// ── Verify Python + whisper are installed ─────────────────────────────────────
-function verifySetup() {
-  try {
-    execSync(`${PYTHON_BIN} -c "import whisper"`, { stdio: "pipe" });
   } catch {
-    throw new Error(
-      "openai-whisper Python package not found.\n" +
-      "Run:  npm run setup:whisper\n" +
-      "Or manually:  pip install openai-whisper"
-    );
+    console.warn("ffmpeg not found, sending original file to Groq.");
+    return inputPath;
   }
 }
 
-// ── Main transcription function ───────────────────────────────────────────────
-/**
- * Transcribe audio using OpenAI Whisper running locally via Python.
- * 100% free, offline, no API key needed.
- *
- * @param {string} filePath  - Path to uploaded audio file
- * @param {string} language  - Language code e.g. "en", "hi" (or "auto" to detect)
- * @returns {{ text, confidence, language }}
- */
-export async function transcribeAudio(filePath, language = "en") {
-  verifySetup();
+function groqRequest(audioPath, language) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file",            fs.createReadStream(audioPath), path.basename(audioPath));
+    form.append("model",           GROQ_MODEL);
+    form.append("response_format", "verbose_json");
+    if (language && language !== "auto") form.append("language", language);
 
-  const wavPath = convertToWav(filePath);
+    const options = {
+      hostname: "api.groq.com",
+      path:     "/openai/v1/audio/transcriptions",
+      method:   "POST",
+      headers: {
+        ...form.getHeaders(),
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+      },
+    };
 
-  try {
-    // Call the Python whisper script and capture JSON output
-    const result = execFileSync(PYTHON_BIN, [
-      WHISPER_SCRIPT,
-      "--file",    wavPath,
-      "--model",   WHISPER_MODEL,
-      "--language", language,
-    ], {
-      timeout: 10 * 60 * 1000,   // 10 min max for large files
-      maxBuffer: 10 * 1024 * 1024,
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(body);
+          if (json.error) return reject(new Error(json.error.message || "Groq API error"));
+          resolve(json);
+        } catch {
+          reject(new Error(`Groq parse error: ${body.slice(0, 200)}`));
+        }
+      });
     });
 
-    const parsed = JSON.parse(result.toString().trim());
+    req.on("error", reject);
+    form.pipe(req);
+  });
+}
 
-    if (parsed.error) {
-      throw new Error(parsed.error);
-    }
+export async function transcribeAudio(filePath, language = "en") {
+  if (!GROQ_API_KEY) {
+    throw new Error("GROQ_API_KEY not set in .env — get a free key at https://console.groq.com");
+  }
 
-    return {
-      text:       parsed.text || "No speech detected in the audio.",
-      confidence: parsed.confidence || 0.95,
-      language:   parsed.language  || language,
-    };
-  } catch (err) {
-    // If JSON parse fails, the script likely printed an error
-    if (err instanceof SyntaxError) {
-      throw new Error("Whisper transcription failed. Check Python setup.");
-    }
-    throw err;
+  const fileSizeMB = fs.statSync(filePath).size / (1024 * 1024);
+  if (fileSizeMB > 25) {
+    throw new Error(`File too large (${fileSizeMB.toFixed(1)} MB). Groq limit is 25 MB.`);
+  }
+
+  const convertedPath = convertAudio(filePath);
+
+  try {
+    console.log(`🎤 Sending to Groq Whisper (${fileSizeMB.toFixed(1)} MB)…`);
+    const result     = await groqRequest(convertedPath, language);
+    const text       = result.text?.trim() || "No speech detected.";
+    const detected   = result.language || language;
+    const segments   = result.segments || [];
+    const avgLogProb = segments.length > 0
+      ? segments.reduce((sum, s) => sum + (s.avg_logprob || -0.5), 0) / segments.length
+      : -0.1;
+    const confidence = Math.round(Math.min(1, Math.max(0, Math.exp(avgLogProb))) * 100) / 100;
+
+    console.log(`✅ Transcription done — ${text.split(" ").length} words`);
+    return { text, confidence, language: detected };
   } finally {
-    if (wavPath !== filePath && fs.existsSync(wavPath)) {
-      fs.unlinkSync(wavPath);
-    }
+    if (convertedPath !== filePath && fs.existsSync(convertedPath)) fs.unlinkSync(convertedPath);
   }
 }
